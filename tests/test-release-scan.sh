@@ -47,7 +47,7 @@ check "attribution in LICENSE -> 0" c9 "$T/lp" "$(run c9 "$T/lp" "$T/attr")" 0
 newrepo c10; echo "# by Jane Doe" >"$T/c10/script.sh"; git -C "$T/c10" add -A; git -C "$T/c10" commit -qam tick
 check "attribution outside allowlist -> 1" c10 "$T/lp" "$(run c10 "$T/lp" "$T/attr")" 1
 # 10 attribution as the commit author NAME is sanctioned (the noreply identity)
-newrepo c11; git -C "$T/c11" -c user.name="Jane Doe" -c user.email=33203208+janedoe@users.noreply.github.com commit -q --allow-empty -m tick2
+newrepo c11; git -C "$T/c11" -c user.name="Jane Doe" -c user.email=12345678+janedoe@users.noreply.github.com commit -q --allow-empty -m tick2
 check "attribution as author -> 0" c11 "$T/lp" "$(run c11 "$T/lp" "$T/attr")" 0
 # 11 attribution in a commit MESSAGE is still a leak
 newrepo c12; git -C "$T/c12" commit -q --allow-empty -m "thanks to Jane Doe"
@@ -57,9 +57,21 @@ newrepo c13; echo "contains secretword" >"$T/c13/f"; git -C "$T/c13" commit -qam
 echo "clean now" >"$T/c13/f"; git -C "$T/c13" commit -qam remove-leak
 check "historical blob leak -> 1" c13 "$T/lp" "$(run c13 "$T/lp" "$T/attr")" 1
 # 13 a leak in a HISTORICAL path name, file deleted before the tip
-newrepo c14; echo x >"$T/c13-tmp" ; mkdir -p "$T/c14/acme-codename"; echo x >"$T/c14/acme-codename/f"
+newrepo c14; mkdir -p "$T/c14/acme-codename"; echo x >"$T/c14/acme-codename/f"
 git -C "$T/c14" add -A && git -C "$T/c14" commit -qm add-dir && git -C "$T/c14" rm -rq acme-codename && git -C "$T/c14" commit -qm rm-dir
 check "historical path leak -> 1" c14 "$T/lp" "$(run c14 "$T/lp" "$T/attr")" 1
+# 14 a leaky HISTORICAL path whose blob also exists at an innocent path (rev-list
+#    --objects prints a blob under one path only; path enumeration must not rely on it)
+newrepo c15; echo same-content >"$T/c15/innocent"
+mkdir -p "$T/c15/secretword-dir"; echo same-content >"$T/c15/secretword-dir/f"
+git -C "$T/c15" add -A && git -C "$T/c15" commit -qm both
+git -C "$T/c15" rm -rq secretword-dir && git -C "$T/c15" commit -qm rm-leaky
+check "shadowed path leak -> 1" c15 "$T/lp" "$(run c15 "$T/lp" "$T/attr")" 1
+# 15 a private list committed historically, contents since changed (filename alone)
+newrepo c16; mkdir -p "$T/c16/tests"; printf 'oldjunk\n' >"$T/c16/tests/leak-patterns"
+git -C "$T/c16" add -A && git -C "$T/c16" commit -qm add-list
+git -C "$T/c16" rm -q tests/leak-patterns && git -C "$T/c16" commit -qm rm-list
+check "historical private list -> 1" c16 "$T/lp" "$(run c16 "$T/lp" "$T/attr")" 1
 
 echo "release-scan table: pass=$pass fail=$fail"
 (( fail == 0 ))

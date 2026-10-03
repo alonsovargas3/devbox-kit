@@ -45,10 +45,15 @@ AP="$(readpat "$attr")" || die2 "fix $attr"
 fail=0
 note() { printf '  LEAK %s\n' "$*"; fail=1; }
 
-# 1. private lists must not be anywhere in the tree
+# 1. every path that EVER existed under <ref>: private-list filenames never, and
+#    identifier patterns per path. (git rev-list --objects prints a blob under only
+#    one of its paths, so paths are enumerated from history itself, not from it.)
 while IFS= read -r p; do
-  [[ "$p" == tests/leak-patterns || "$p" == tests/attribution ]] && note "tree contains $p"
-done < <(git ls-tree -r --name-only "$ref")
+  [[ -z "$p" ]] && continue
+  [[ "$p" == tests/leak-patterns || "$p" == tests/attribution ]] && note "history contains $p"
+  if [[ "$p" =~ $ALLOW ]]; then pat="$LP"; else pat="${LP}${AP:+|$AP}"; fi
+  grep -q -E "$pat" <<<"$p" && note "path $p matches"
+done < <(git log --format= --name-only "$ref" | sort -u)
 
 # 2. every blob reachable from <ref> — ALL history, not just the tip tree — plus
 #    every historical path name. Attribution patterns apply only to allowlisted paths.
@@ -61,10 +66,7 @@ while IFS= read -r obj; do
   [[ -n "$hit" ]] && note "blob $p:$hit"
 done < <(git rev-list --objects "$ref")
 
-# 3. path names
-git ls-tree -r --name-only "$ref" | grep -E "${LP}${AP:+|$AP}" >/dev/null 2>&1 && note "a path name matches"
-
-# 4. raw commit metadata of every reachable commit. The author/committer IDENTITY
+# 3. raw commit metadata of every reachable commit. The author/committer IDENTITY
 #    lines carry the sanctioned attribution (name + noreply email); messages and
 #    trailers never do.
 while IFS= read -r c; do
