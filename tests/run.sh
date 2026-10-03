@@ -78,8 +78,18 @@ if [[ -s "$lp" ]]; then
 else
   echo "  ! tests/leak-patterns missing — private identifier scan SKIPPED (cp tests/leak-patterns.example)"
 fi
-hits=$(git ls-files -coz --exclude-standard | xargs -0 grep -n -E "$pat" 2>/dev/null)
-if [[ -n "$hits" ]]; then nok "identifiers found:"; echo "$hits" | head -20; else okf "no identifiers (generic + private patterns)"; fi
+serr="$(mktemp)"
+hits=$(git ls-files -coz --exclude-standard | xargs -0 grep -n -E "$pat" 2>"$serr")
+if [[ -s "$serr" ]]; then
+  nok "leak-scan tool errors (results unreliable):"; sed 's/^/    /' "$serr" | head -5
+elif [[ -n "$hits" ]]; then
+  nok "identifiers found:"; echo "$hits" | head -20
+elif [[ "$pat" != '/[U]sers/' ]]; then
+  okf "no identifiers (generic + private patterns)"
+else
+  okf "no generic identifiers (private list absent — see warning above)"
+fi
+rm -f "$serr"
 
 echo; (( fail == 0 )) && echo "ALL PASSED" || echo "FAILURES"
 exit $fail
