@@ -1,0 +1,4 @@
+# Heavy work → devbox
+Docker stacks and test/lint/build suites run on the devbox (`ssh __ALIAS__`, Ubuntu, same `~/...` paths), not on this laptop. Check for `/etc/devbox.env` to know where you are:
+- **Laptop (no `/etc/devbox.env`):** prefer the devbox: `ssh __ALIAS__ 'cd <same path under ~> && <cmd>'`, or an Orca worktree on the `__ALIAS__` host. A hook turns away local Docker/test/lint/build commands and tells you to ask **"Run where?"** (Devbox / Local / Local for this session). Ask, then carry on with the choice. Local = prefix the command with `DEVBOX_RUN=local `; "for this session" = keep using that prefix without asking again. If the devbox is stopped and they pick it, run `devbox up` first. Unattended Orca workers can't ask, so place heavy workers on the devbox.
+- **devbox (`/etc/devbox.env` exists):** run them normally.

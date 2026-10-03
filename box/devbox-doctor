@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# devbox-doctor — one-screen health check of what expires or drifts on the box.
+# Default checks take a second or two (fine for the login banner); `--full` adds gh, the
+# GitHub SSH key, gcloud, and Claude Code. Profile checks: ~/.devbox/profile/doctor.d/*.sh
+# (each prints its own ✓/! lines; they receive FULL=0|1 in the environment).
+set -uo pipefail
+FULL=0; [[ "${1:-}" == --full ]] && FULL=1
+[[ -f ~/.devbox/config ]] && . ~/.devbox/config
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+
+echo "devbox-doctor ($(date -u +%H:%MZ))"
+
+# AWS: the cached SSO token lasts ~1h and the CLI refreshes it silently, so only a real
+# call tells you whether you must log in. One check per sso-session's first profile.
+for s in ${DEVBOX_SSO_SESSIONS:-}; do
+  p=$(awk -v s="$s" '/^\[profile /{name=$2; sub(/\]$/,"",name)} $1=="sso_session" && $3==s {print name; exit}' ~/.aws/config 2>/dev/null)
+  if [[ -z "$p" ]]; then warn "no profile in ~/.aws/config uses sso-session $s"; continue; fi
+  if aws sts get-caller-identity --profile "$p" >/dev/null 2>&1; then ok "AWS SSO $s live ($p)"
+  else warn "AWS SSO $s expired — run: devbox-login"; fi
+done
+
+# Auto-stop verdict (from the idle check; sudo -n so the banner never prompts).
+if [[ -f /data/keepawake ]] && (( $(date +%s) - $(stat -c %Y /data/keepawake) < 43200 )); then
+  warn "keepawake ON (auto-stop suspended until $(date -u -d @$(( $(stat -c %Y /data/keepawake) + 43200 )) +%H:%MZ)) — clear: sudo rm /data/keepawake"
+else ok "auto-stop — $(sudo -n /usr/local/sbin/devbox-idle-check --explain 2>/dev/null || cat /run/devbox-idle-status 2>/dev/null || echo "status unknown")"; fi
+
+# Main checkouts vs GitHub (new Orca worktrees can fetch themselves; work on main needs a pull).
+for rel in ${DOCTOR_REPOS:-}; do
+  repo="$HOME/$rel"; [[ -d "$repo/.git" ]] || continue
+  name=$(basename "$repo")
+  br=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); br=${br:-main}
+  if ! timeout 8 git -C "$repo" fetch -q origin "$br" 2>/dev/null; then warn "$name: fetch failed (offline or GitHub auth)"; continue; fi
+  behind=$(git -C "$repo" rev-list --count "$br..origin/$br" 2>/dev/null || echo "?")
+  ahead=$(git -C "$repo" rev-list --count "origin/$br..$br" 2>/dev/null || echo "?")
+  if [[ "$behind" == 0 && "$ahead" == 0 ]]; then ok "$name $br = origin/$br"
+  elif [[ "$behind" != 0 ]]; then warn "$name $br is $behind behind origin/$br — git -C ~/$rel pull"
+  else warn "$name $br is $ahead ahead of origin/$br (unpushed commits)"; fi
+done
+
+# Disks
+for m in /data /; do
+  used=$(df --output=pcent "$m" | tail -1 | tr -d ' %')
+  (( used < 80 )) && ok "$m ${used}% used" || warn "$m ${used}% used — docker system prune, or grow the volume (online)"
+done
+
+if (( FULL )); then
+  gh auth status >/dev/null 2>&1 && ok "gh logged in" || warn "gh not logged in — gh auth login -h github.com -p ssh --web"
+  # GitHub exits 1 even on successful auth, so match the output, not the status.
+  gh_ssh=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com 2>&1 || true)
+  [[ "$gh_ssh" == *"successfully authenticated"* ]] && ok "GitHub SSH key ok" || warn "GitHub SSH key rejected — add ~/.ssh/id_ed25519.pub at github.com/settings/keys"
+  if [[ "${GCLOUD:-off}" == on ]]; then
+    a=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)
+    [[ -n "$a" ]] && gcloud auth print-access-token >/dev/null 2>&1 && ok "gcloud: $a" || warn "gcloud needs login — devbox-login"
+  fi
+  claude auth status 2>/dev/null | grep -q '"loggedIn": true' && ok "Claude Code logged in" || warn "Claude Code not logged in — run claude, then /login"
+fi
+
+for f in ~/.devbox/profile/doctor.d/*.sh; do [[ -f "$f" ]] && FULL=$FULL bash "$f"; done
+exit 0

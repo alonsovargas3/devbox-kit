@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+docs/superpowers/
+.superpowers/
+tests/leak-patterns
+tests/attribution

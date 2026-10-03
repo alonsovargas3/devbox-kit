@@ -1,0 +1,27 @@
+# devbox-kit shell helpers — installed to ~/.bashrc.devbox by `devbox push-helpers` and
+# sourced from ~/.bashrc. Settings come from ~/.devbox/config (written by push-helpers
+# from your laptop config); project extras come from ~/.devbox/profile/bashrc if present.
+
+[ -f ~/.devbox/config ] && . ~/.devbox/config
+
+# Re-authenticate everything that expires, in one go.
+#   AWS: one device-code login per sso-session refreshes every profile that uses it.
+#   gcloud (GCLOUD=on): --update-adc refreshes the user login AND Application Default Credentials.
+devbox-login() {
+  local s
+  for s in ${DEVBOX_SSO_SESSIONS:-}; do
+    echo "[devbox] AWS SSO session $s — open the URL, approve"
+    aws sso login --use-device-code --sso-session "$s" || return 1
+  done
+  if [ "${GCLOUD:-off}" = on ] && command -v gcloud >/dev/null 2>&1; then
+    if gcloud auth print-access-token >/dev/null 2>&1 && gcloud auth application-default print-access-token >/dev/null 2>&1; then
+      echo "[devbox] gcloud still valid — skipped"
+    else
+      echo "[devbox] gcloud — open the URL, approve, paste the code back here"
+      gcloud auth login --update-adc --no-launch-browser || return 1
+    fi
+  fi
+  devbox-doctor
+}
+
+[ -f ~/.devbox/profile/bashrc ] && . ~/.devbox/profile/bashrc

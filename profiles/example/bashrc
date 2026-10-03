@@ -1,0 +1,3 @@
+# Example profile shell helpers, sourced on the box by ~/.bashrc.devbox.
+# stack-up() { cd ~/Dev/myapp && docker compose up -d "$@"; }
+# stack-down() { cd ~/Dev/myapp && docker compose down; }

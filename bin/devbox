@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# devbox — create and run a personal remote dev box on AWS. Laptop-side CLI of devbox-kit.
+#
+#   devbox [--box NAME] <command> [args]
+#
+# Setup (see SETUP.md for the full walkthrough):
+#   init NAME                 create ~/.config/devbox/NAME.env from config.example.env
+#   check                     preflight: tools, AWS identity, network, permissions (EC2 dry-run probes)
+#   provision [--dry-run]     create what's missing (SG, role/profile, key, data volume, instance, snapshots)
+#   ssh-config                write the `Host <alias>` block (SSH over SSM) into ~/.ssh/config
+#   bootstrap                 install system tools on the box (+ PROFILE/bootstrap.sh)
+#   push-helpers              install shell helpers, doctor, claude-trust, idle check (+ profile files)
+#   setup-identity            git identity, box GitHub key, ~/.aws/config copy
+#   clone                     clone REPOS on the box and trust their main checkouts for Claude
+#   sync-claude [--dry-run]   mirror your ~/.claude setup onto the box
+#   install-guard             laptop: Claude asks "Run where?" before local Docker/test/lint/build
+#   install-skill             laptop: install the /devbox-setup Claude skill
+# Daily:
+#   up | down | status | ssh [cmd] | login | doctor | wip | keepawake [off] | resize TYPE
+# Teardown:
+#   destroy [--delete-data]   remove this box's resources (asks you to type the box name)
+set -euo pipefail
+export AWS_PAGER=""
+
+self="$0"; while [[ -L "$self" ]]; do l="$(readlink "$self")"; [[ "$l" == /* ]] && self="$l" || self="$(dirname "$self")/$l"; done
+KIT="$(cd "$(dirname "$self")/.." && pwd)"
+CFG_DIR="${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; FAILED=1; }
+die()  { echo "devbox: $*" >&2; exit 1; }
+usage() { sed -n '2,21p' "$self" | sed 's/^# \{0,1\}//'; }
+
+BOX="${DEVBOX_BOX:-}"
+if [[ "${1:-}" == --box ]]; then BOX="${2:?--box needs a name}"; shift 2; fi
+cmd="${1:-help}"; shift || true
+
+load_config() {
+  [[ -n "$BOX" ]] || BOX="$(cat "$CFG_DIR/default" 2>/dev/null || true)"
+  [[ -n "$BOX" ]] || die "no box selected: run 'devbox init NAME', or pass --box NAME"
+  local f="$CFG_DIR/$BOX.env"
+  [[ -r "$f" ]] || die "no config $f (run: devbox init $BOX)"
+  # shellcheck disable=SC1090
+  . "$f"
+  local v; for v in DEVBOX_NAME AWS_REGION AZ OWNER_EMAIL GIT_NAME GIT_EMAIL; do
+    [[ -n "${!v:-}" ]] || die "$f: $v is required"
+  done
+  : "${INSTANCE_TYPE:=m7i-flex.xlarge}" "${ARCH:=amd64}" "${DATA_GB:=100}" "${ROOT_GB:=40}" "${IDLE_MIN:=45}"
+  : "${SUBNET_ID:=}" "${ASSOCIATE_PUBLIC_IP:=yes}" "${INSTANCE_PROFILE:=}" "${EBS_KMS_KEY:=}" "${EXTRA_TAGS:=}"
+  : "${SNAPSHOTS:=on}" "${SNAPSHOT_KEEP:=7}" "${SNAPSHOT_TIME_UTC:=23:00}" "${SSH_HOST_ALIAS:=devbox}"
+  : "${SSH_KEY_FILE:=$HOME/.ssh/${DEVBOX_NAME}_ed25519}" "${DEVBOX_SSO_SESSIONS:=}" "${COPY_AWS_CONFIG:=yes}"
+  : "${GCLOUD:=off}" "${SYNC_CLAUDE_ENV:=no}" "${REPOS:=}" "${WIP_ROOTS:=Dev}" "${PROFILE:=}"
+  : "${RETIRED_SKILLS:=}" "${RETIRED_PLUGINS:=}" "${RETIRED_HOOKS:=}"
+  [[ "$ARCH" == amd64 || "$ARCH" == arm64 ]] || die "ARCH must be amd64 or arm64"
+  export AWS_REGION
+  [[ -n "${AWS_PROFILE:-}" ]] && export AWS_PROFILE
+  A="$SSH_HOST_ALIAS"
+  ROLE="$DEVBOX_NAME-role"; IPROF="${INSTANCE_PROFILE:-$DEVBOX_NAME-profile}"; SGNAME="$DEVBOX_NAME-sg"; VOLNAME="$DEVBOX_NAME-data"
+  # BASE_TAGS carry no Name: each resource adds its own (duplicate keys are rejected).
+  BASE_TAGS="{Key=purpose,Value=devbox},{Key=owner,Value=$OWNER_EMAIL},{Key=devbox-name,Value=$DEVBOX_NAME}"
+  local kv; for kv in $EXTRA_TAGS; do BASE_TAGS="$BASE_TAGS,{Key=${kv%%=*},Value=${kv#*=}}"; done
+  TAGS="{Key=Name,Value=$DEVBOX_NAME},$BASE_TAGS"
+  VOL_TAGS="{Key=Name,Value=$VOLNAME},$BASE_TAGS,{Key=devbox-snapshot,Value=$DEVBOX_NAME}"
+  ROOT_TAGS="{Key=Name,Value=$DEVBOX_NAME-root},$BASE_TAGS"
+}
+
+# --- AWS lookups ------------------------------------------------------------------------
+iid() {
+  aws ec2 describe-instances --filters "Name=tag:Name,Values=$DEVBOX_NAME" \
+    Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text
+}
+need_iid() { I="$(iid)"; [[ "$I" != None ]] || die "no instance named $DEVBOX_NAME (run: devbox provision)"; }
+state() { aws ec2 describe-instances --instance-ids "$1" --query 'Reservations[0].Instances[0].[State.Name,InstanceType]' --output text; }
+subnet() {
+  if [[ -n "$SUBNET_ID" ]]; then echo "$SUBNET_ID"; return; fi
+  local vpc; vpc=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
+  [[ "$vpc" != None ]] || { echo None; return; }
+  aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" "Name=availability-zone,Values=$AZ" --query 'Subnets[0].SubnetId' --output text
+}
+ami() {
+  aws ssm get-parameter --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/$ARCH/hvm/ebs-gp3/ami-id" \
+    --query Parameter.Value --output text
+}
+wait_ssm() {
+  printf 'waiting for SSM agent'
+  for _ in $(seq 1 60); do
+    [[ "$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$1" \
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)" == Online ]] && { echo ' — online'; return; }
+    printf '.'; sleep 5
+  done
+  echo; die "SSM agent not online after 5 min (check subnet egress and the instance profile)"
+}
+dryrun() { # dryrun <label> <aws args...>: EC2 DryRun permission probe
+  local label="$1" out; shift
+  out=$(aws "$@" --dry-run 2>&1 || true)
+  if [[ "$out" == *DryRunOperation* ]]; then ok "allowed: $label"
+  elif [[ "$out" == *UnauthorizedOperation* || "$out" == *AccessDenied* ]]; then bad "DENIED: $label — see iam/provisioner-policy.json"
+  else warn "$label: $(printf '%s' "$out" | tail -1 | cut -c1-140)"; fi
+}
+
+# --- commands -----------------------------------------------------------------------------
+cmd_init() {
+  local name="${1:?usage: devbox init NAME}" f="$CFG_DIR/$1.env"
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  [[ -e "$f" ]] && die "$f already exists"
+  sed "s/^DEVBOX_NAME=.*/DEVBOX_NAME=\"$name\"             # unique per AWS account; names every resource/" "$KIT/config.example.env" >"$f"
+  chmod 600 "$f"
+  [[ -s "$CFG_DIR/default" ]] || echo "$name" >"$CFG_DIR/default"
+  echo "wrote $f$( [[ "$(cat "$CFG_DIR/default")" == "$name" ]] && echo ' (default box)')"
+  echo "next: edit it (the Required block at least), then run: devbox --box $name check"
+}
+
+cmd_check() {
+  FAILED=0
+  bold "laptop tools"
+  local t; for t in aws session-manager-plugin jq python3 ssh rsync; do
+    command -v "$t" >/dev/null && ok "$t" || bad "$t missing"
+  done
+  [[ "$(aws --version 2>&1)" == aws-cli/2* ]] && ok "aws cli v2" || bad "aws cli v2 required"
+  command -v gh >/dev/null && ok "gh (optional)" || warn "gh not installed (optional: adds the box's GitHub key for you)"
+
+  bold "AWS identity (${AWS_PROFILE:-default credentials}, $AWS_REGION)"
+  local who; if who=$(aws sts get-caller-identity --query '[Account,Arn]' --output text 2>&1); then ok "$who"
+  else bad "not authenticated: $(echo "$who" | tail -1)"; echo; return 1; fi
+
+  bold "placement"
+  [[ "$(aws ec2 describe-availability-zones --zone-names "$AZ" --query 'AvailabilityZones[0].State' --output text 2>/dev/null)" == available ]] \
+    && ok "AZ $AZ" || bad "AZ $AZ not available in $AWS_REGION"
+  [[ -n "$(aws ec2 describe-instance-type-offerings --location-type availability-zone --filters "Name=location,Values=$AZ" \
+    "Name=instance-type,Values=$INSTANCE_TYPE" --query 'InstanceTypeOfferings[0].InstanceType' --output text 2>/dev/null | grep -v None)" ]] \
+    && ok "$INSTANCE_TYPE offered in $AZ" || bad "$INSTANCE_TYPE not offered in $AZ"
+  local img; img=$(ami 2>/dev/null) && ok "Ubuntu 24.04 $ARCH AMI $img" || bad "cannot read the Canonical AMI SSM parameter"
+  local sn; sn=$(subnet 2>/dev/null || echo None)
+  if [[ "$sn" == None || -z "$sn" ]]; then bad "no subnet: this region has no default VPC — set SUBNET_ID"
+  else
+    local vpc rt; vpc=$(aws ec2 describe-subnets --subnet-ids "$sn" --query 'Subnets[0].VpcId' --output text)
+    ok "subnet $sn (vpc $vpc)"
+    rt=$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$sn" \
+      --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`]|[0].[GatewayId,NatGatewayId]' --output text 2>/dev/null || true)
+    [[ -z "$rt" || "$rt" == None ]] && rt=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" Name=association.main,Values=true \
+      --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`]|[0].[GatewayId,NatGatewayId]' --output text 2>/dev/null || true)
+    case "$rt" in
+      *igw-*) ok "egress via internet gateway"; [[ "$ASSOCIATE_PUBLIC_IP" == yes ]] || bad "IGW subnet needs ASSOCIATE_PUBLIC_IP=yes" ;;
+      *nat-*) ok "egress via NAT gateway" ;;
+      *) bad "no 0.0.0.0/0 route: the box needs internet egress (SSM, apt, GitHub)" ;;
+    esac
+  fi
+
+  bold "permissions (EC2 dry-run probes)"
+  dryrun "ec2:CreateVolume (+ tags)" ec2 create-volume --availability-zone "$AZ" --size "$DATA_GB" --volume-type gp3 --encrypted \
+    --tag-specifications "ResourceType=volume,Tags=[$VOL_TAGS]"
+  [[ "$sn" != None && -n "$sn" ]] && {
+    dryrun "ec2:CreateSecurityGroup" ec2 create-security-group --group-name "$SGNAME-probe" --description probe --vpc-id "$vpc"
+    dryrun "ec2:RunInstances ($INSTANCE_TYPE)" ec2 run-instances --image-id "${img:-ami-00000000}" --instance-type "$INSTANCE_TYPE" --subnet-id "$sn"
+  }
+  if [[ -n "$INSTANCE_PROFILE" ]]; then
+    aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE" >/dev/null 2>&1 \
+      && ok "instance profile $INSTANCE_PROFILE exists" || bad "INSTANCE_PROFILE $INSTANCE_PROFILE not found"
+  elif aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then ok "role $ROLE exists"
+  else warn "will create role $ROLE + profile (needs iam:CreateRole/PassRole; if your org blocks it, set INSTANCE_PROFILE)"; fi
+  if [[ "$SNAPSHOTS" == on ]]; then
+    aws iam get-role --role-name AWSDataLifecycleManagerDefaultRole >/dev/null 2>&1 \
+      && ok "DLM default role exists" || warn "DLM default role missing — provision creates it (or set SNAPSHOTS=off)"
+  fi
+
+  bold "existing resources named $DEVBOX_NAME"
+  local i; i=$(iid 2>/dev/null || echo None)
+  [[ "$i" == None ]] && ok "no instance yet" || ok "instance $i ($(state "$i" | tr '\t' ' '))"
+  echo
+  (( FAILED == 0 )) && bold "check passed" || { bold "check FAILED — fix the ✗ lines"; return 1; }
+}
+
+cmd_provision() {
+  local dry=0; [[ "${1:-}" == --dry-run ]] && dry=1
+  plan() { if (( dry )); then echo "  would $*"; return 1; fi; }  # returns 1 in dry-run so callers skip the action
+  [[ "$(aws sts get-caller-identity --query Account --output text)" =~ ^[0-9]{12}$ ]] || die "not authenticated"
+  local sn vpc sg vol i img ud kms=()
+  sn=$(subnet); [[ "$sn" != None ]] || die "no subnet: set SUBNET_ID (no default VPC in $AWS_REGION)"
+  vpc=$(aws ec2 describe-subnets --subnet-ids "$sn" --query 'Subnets[0].VpcId' --output text)
+  [[ -n "$EBS_KMS_KEY" ]] && kms=(--kms-key-id "$EBS_KMS_KEY")
+  bold "$DEVBOX_NAME in $AWS_REGION/$AZ, subnet $sn$( (( dry )) && echo ' — DRY RUN, nothing is created')"
+
+  sg=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc" "Name=group-name,Values=$SGNAME" --query 'SecurityGroups[0].GroupId' --output text)
+  if [[ "$sg" == None ]]; then
+    plan "create security group $SGNAME (no ingress)" && {
+      sg=$(aws ec2 create-security-group --vpc-id "$vpc" --group-name "$SGNAME" --description "devbox $DEVBOX_NAME - no ingress, SSH via SSM" \
+        --tag-specifications "ResourceType=security-group,Tags=[$TAGS]" --query GroupId --output text)
+      ok "created SG $sg (no ingress rules)"; }
+  else ok "SG $sg exists"; fi
+
+  if [[ -z "$INSTANCE_PROFILE" ]]; then
+    if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+      plan "create role $ROLE (AmazonSSMManagedInstanceCore only)" && {
+        aws iam create-role --role-name "$ROLE" \
+          --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+          --tags Key=purpose,Value=devbox Key=owner,Value="$OWNER_EMAIL" Key=devbox-name,Value="$DEVBOX_NAME" >/dev/null
+        aws iam attach-role-policy --role-name "$ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        ok "created role $ROLE"; }
+    else ok "role $ROLE exists"; fi
+    if ! aws iam get-instance-profile --instance-profile-name "$IPROF" >/dev/null 2>&1; then
+      plan "create instance profile $IPROF" && {
+        aws iam create-instance-profile --instance-profile-name "$IPROF" >/dev/null
+        aws iam add-role-to-instance-profile --instance-profile-name "$IPROF" --role-name "$ROLE"
+        ok "created instance profile $IPROF; waiting for IAM propagation"; sleep 15; }
+    else ok "instance profile $IPROF exists"; fi
+  else ok "using existing instance profile $IPROF"; fi
+
+  if [[ ! -f "$SSH_KEY_FILE" ]]; then
+    plan "generate $SSH_KEY_FILE" && { ssh-keygen -t ed25519 -N '' -C "$DEVBOX_NAME" -f "$SSH_KEY_FILE" >/dev/null; ok "generated $SSH_KEY_FILE"; }
+  fi
+  if ! aws ec2 describe-key-pairs --key-names "$DEVBOX_NAME" >/dev/null 2>&1; then
+    plan "import key pair $DEVBOX_NAME" && {
+      aws ec2 import-key-pair --key-name "$DEVBOX_NAME" --public-key-material "fileb://$SSH_KEY_FILE.pub" \
+        --tag-specifications "ResourceType=key-pair,Tags=[$TAGS]" >/dev/null; ok "imported key pair $DEVBOX_NAME"; }
+  else ok "key pair $DEVBOX_NAME exists"; fi
+
+  vol=$(aws ec2 describe-volumes --filters "Name=tag:Name,Values=$VOLNAME" Name=status,Values=available,in-use --query 'Volumes[0].VolumeId' --output text)
+  if [[ "$vol" == None ]]; then
+    plan "create data volume $VOLNAME (${DATA_GB} GB gp3, encrypted) in $AZ" && {
+      vol=$(aws ec2 create-volume --availability-zone "$AZ" --size "$DATA_GB" --volume-type gp3 --encrypted ${kms[@]+"${kms[@]}"} \
+        --tag-specifications "ResourceType=volume,Tags=[$VOL_TAGS]" \
+        --query VolumeId --output text)
+      aws ec2 wait volume-available --volume-ids "$vol"; ok "created data volume $vol"; }
+  else ok "data volume $vol exists"; fi
+
+  i=$(iid)
+  if [[ "$i" == None ]]; then
+    img=$(ami)
+    if plan "launch $INSTANCE_TYPE ($ARCH, $img), root ${ROOT_GB} GB, public IP=$ASSOCIATE_PUBLIC_IP"; then
+      ud="$(mktemp)"; trap 'rm -f "$ud"' RETURN
+      sed -e "s/__DATA_VOLUME_ID__/$vol/g" -e "s/__IDLE_MIN__/$IDLE_MIN/g" -e "s/__ARCH__/$ARCH/g" -e "s/__DEVBOX_NAME__/$DEVBOX_NAME/g" \
+        "$KIT/box/user-data.sh" >"$ud"
+      local pub=--associate-public-ip-address; [[ "$ASSOCIATE_PUBLIC_IP" == yes ]] || pub=--no-associate-public-ip-address
+      local rootkms=""; [[ -n "$EBS_KMS_KEY" ]] && rootkms=",KmsKeyId=$EBS_KMS_KEY"
+      i=$(aws ec2 run-instances --image-id "$img" --instance-type "$INSTANCE_TYPE" \
+        --subnet-id "$sn" --security-group-ids "$sg" "$pub" \
+        --iam-instance-profile Name="$IPROF" --key-name "$DEVBOX_NAME" \
+        --instance-initiated-shutdown-behavior stop \
+        --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+        --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_GB,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true$rootkms}" \
+        --user-data "file://$ud" \
+        --tag-specifications "ResourceType=instance,Tags=[$TAGS]" "ResourceType=volume,Tags=[$ROOT_TAGS]" \
+        --query 'Instances[0].InstanceId' --output text)
+      ok "launched $i"; aws ec2 wait instance-running --instance-ids "$i"
+    fi
+  else ok "instance $i exists"; fi
+
+  if (( ! dry )) && [[ "$i" != None ]]; then
+    local att; att=$(aws ec2 describe-volumes --volume-ids "$vol" --query 'Volumes[0].Attachments[0].InstanceId' --output text)
+    if [[ "$att" == None ]]; then
+      aws ec2 attach-volume --volume-id "$vol" --instance-id "$i" --device /dev/sdf >/dev/null
+      aws ec2 wait volume-in-use --volume-ids "$vol"; ok "attached $vol to $i"
+    elif [[ "$att" != "$i" ]]; then die "data volume $vol is attached to $att, not $i"
+    else ok "data volume attached"; fi
+  fi
+
+  if [[ "$SNAPSHOTS" == on ]]; then
+    if ! aws iam get-role --role-name AWSDataLifecycleManagerDefaultRole >/dev/null 2>&1; then
+      plan "create the DLM default role" && { aws dlm create-default-role --resource-type snapshot >/dev/null \
+        && { ok "created DLM default role"; sleep 10; } || warn "cannot create DLM default role — snapshots skipped (set SNAPSHOTS=off to silence)"; }
+    fi
+    if [[ -z "$(aws dlm get-lifecycle-policies --target-tags "devbox-snapshot=$DEVBOX_NAME" --query 'Policies[].PolicyId' --output text 2>/dev/null)" ]]; then
+      plan "create DLM policy (daily $SNAPSHOT_TIME_UTC UTC, keep $SNAPSHOT_KEEP)" && {
+        local acct; acct=$(aws sts get-caller-identity --query Account --output text)
+        aws dlm create-lifecycle-policy --execution-role-arn "arn:aws:iam::$acct:role/AWSDataLifecycleManagerDefaultRole" \
+          --description "$DEVBOX_NAME data volume daily snapshots" --state ENABLED \
+          --tags purpose=devbox,owner="$OWNER_EMAIL",devbox-name="$DEVBOX_NAME" \
+          --policy-details "{\"PolicyType\":\"EBS_SNAPSHOT_MANAGEMENT\",\"ResourceTypes\":[\"VOLUME\"],\"TargetTags\":[{\"Key\":\"devbox-snapshot\",\"Value\":\"$DEVBOX_NAME\"}],\"Schedules\":[{\"Name\":\"daily\",\"CreateRule\":{\"Interval\":24,\"IntervalUnit\":\"HOURS\",\"Times\":[\"$SNAPSHOT_TIME_UTC\"]},\"RetainRule\":{\"Count\":$SNAPSHOT_KEEP},\"CopyTags\":true}]}" >/dev/null \
+          && ok "created DLM policy" || warn "DLM policy not created"; }
+    else ok "DLM policy exists"; fi
+  fi
+  (( dry )) && { echo; cmd_check >/dev/null 2>&1 && ok "preflight check passes" || warn "preflight has failures — run: devbox check"; }
+  echo; if (( dry )); then bold "dry run only: run 'devbox provision' to create these"; else bold "next: devbox ssh-config"; fi
+}
+
+cmd_destroy() {
+  local deldata=0; [[ "${1:-}" == --delete-data ]] && deldata=1
+  local i sg vol pol snaps
+  i=$(iid); vol=$(aws ec2 describe-volumes --filters "Name=tag:Name,Values=$VOLNAME" --query 'Volumes[0].VolumeId' --output text)
+  sg=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SGNAME" --query 'SecurityGroups[0].GroupId' --output text)
+  pol=$(aws dlm get-lifecycle-policies --target-tags "devbox-snapshot=$DEVBOX_NAME" --query 'Policies[].PolicyId' --output text 2>/dev/null || true)
+  snaps=$(aws ec2 describe-snapshots --owner-ids self --filters "Name=tag:devbox-snapshot,Values=$DEVBOX_NAME" --query 'Snapshots[].SnapshotId' --output text)
+  bold "destroy $DEVBOX_NAME ($AWS_REGION, account $(aws sts get-caller-identity --query Account --output text))"
+  echo "  instance:          $i (root volume goes with it)"
+  echo "  security group:    $sg"
+  echo "  key pair:          $DEVBOX_NAME"
+  [[ -z "$INSTANCE_PROFILE" ]] && echo "  role / profile:    $ROLE / $IPROF" || echo "  instance profile:  $INSTANCE_PROFILE (yours — kept)"
+  echo "  DLM policy:        ${pol:-none}"
+  if (( deldata )); then echo "  DATA volume:       $vol  ← DELETED (repos, logins, Docker)"; echo "  snapshots:         ${snaps:-none}  ← DELETED"
+  else echo "  data volume:       $vol (KEPT — re-run provision to attach a new instance; --delete-data removes it)"; fi
+  read -r -p "type the box name to confirm: " ans; [[ "$ans" == "$DEVBOX_NAME" ]] || die "not confirmed"
+  if (( deldata )); then read -r -p "the data volume and snapshots are unrecoverable; type the box name again: " ans
+    [[ "$ans" == "$DEVBOX_NAME" ]] || die "not confirmed"; fi
+  if [[ "$i" != None ]]; then aws ec2 terminate-instances --instance-ids "$i" >/dev/null; aws ec2 wait instance-terminated --instance-ids "$i"; ok "terminated $i"; fi
+  aws ec2 delete-key-pair --key-name "$DEVBOX_NAME" >/dev/null 2>&1 && ok "deleted key pair" || true
+  [[ "$sg" != None ]] && { aws ec2 delete-security-group --group-id "$sg" >/dev/null && ok "deleted SG $sg"; }
+  if [[ -z "$INSTANCE_PROFILE" ]]; then
+    aws iam remove-role-from-instance-profile --instance-profile-name "$IPROF" --role-name "$ROLE" 2>/dev/null || true
+    aws iam delete-instance-profile --instance-profile-name "$IPROF" 2>/dev/null && ok "deleted instance profile" || true
+    aws iam detach-role-policy --role-name "$ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
+    aws iam delete-role --role-name "$ROLE" 2>/dev/null && ok "deleted role" || true
+  fi
+  local p; for p in $pol; do aws dlm delete-lifecycle-policy --policy-id "$p" && ok "deleted DLM policy $p"; done
+  if (( deldata )); then
+    [[ "$vol" != None ]] && { aws ec2 wait volume-available --volume-ids "$vol"; aws ec2 delete-volume --volume-id "$vol" && ok "deleted data volume $vol"; }
+    local s; for s in $snaps; do aws ec2 delete-snapshot --snapshot-id "$s" && ok "deleted snapshot $s"; done
+  fi
+  bold "done. Remove the Host $A block from ~/.ssh/config if you won't re-provision."
+}
+
+cmd_ssh_config() {
+  need_iid
+  local cfg="$HOME/.ssh/config" tmp block
+  mkdir -p "$HOME/.ssh"; touch "$cfg"; chmod 600 "$cfg"
+  block="# BEGIN devbox-kit $A
+Host $A
+  HostName $I
+  User ubuntu
+  IdentityFile $SSH_KEY_FILE
+  IdentitiesOnly yes
+  ServerAliveInterval 30
+  StrictHostKeyChecking accept-new
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
+  ProxyCommand sh -c \"${AWS_PROFILE:+AWS_PROFILE=$AWS_PROFILE }aws ssm start-session --region $AWS_REGION --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p\"
+# END devbox-kit $A"
+  tmp="$(mktemp)"
+  awk -v b="# BEGIN devbox-kit $A" -v e="# END devbox-kit $A" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$cfg" >"$tmp"
+  { printf '%s\n\n' "$block"; cat "$tmp"; } >"$cfg"; rm -f "$tmp"
+  echo "wrote Host $A -> $I in $cfg"
+}
+
+cmd_push_helpers() {
+  local repos="" r
+  for r in $REPOS; do repos="$repos ${r#*:}"; done
+  ssh "$A" "mkdir -p ~/.devbox/profile && cat > ~/.devbox/config" <<EOF
+# written by \`devbox push-helpers\` from the laptop config; edit that, not this
+DEVBOX_NAME="$DEVBOX_NAME"
+DEVBOX_SSO_SESSIONS="$DEVBOX_SSO_SESSIONS"
+GCLOUD="$GCLOUD"
+DOCTOR_REPOS="${repos# }"
+EOF
+  scp -q "$KIT/box/bashrc.devbox" "$A:.bashrc.devbox"
+  scp -q "$KIT/box/devbox-doctor" "$KIT/box/claude-trust" "$A:/tmp/"
+  # The idle check's single source is box/user-data.sh (a fresh instance gets it at boot);
+  # extract that block so the running box always matches.
+  sed -n "/cat >\/usr\/local\/sbin\/devbox-idle-check <<'EOF'/,/^EOF\$/p" "$KIT/box/user-data.sh" | sed '1d;$d' | ssh "$A" 'cat >/tmp/devbox-idle-check'
+  ssh "$A" "set -e
+    bash -n /tmp/devbox-idle-check && sudo install -m 755 /tmp/devbox-idle-check /usr/local/sbin/ && rm /tmp/devbox-idle-check
+    sudo install -m 755 /tmp/devbox-doctor /tmp/claude-trust /usr/local/bin/ && rm /tmp/devbox-doctor /tmp/claude-trust
+    sudo sed -i 's/^IDLE_MIN=.*/IDLE_MIN=$IDLE_MIN/' /etc/devbox.env
+    grep -q bashrc.devbox ~/.bashrc || printf '\n# devbox-kit helpers\n[ -f ~/.bashrc.devbox ] && . ~/.bashrc.devbox\n[ -t 1 ] && devbox-doctor\n' >> ~/.bashrc"
+  if [[ -n "$PROFILE" ]]; then
+    local pd; pd="$(cd "$PROFILE" && pwd)"
+    rsync -a --delete --exclude bootstrap.sh --exclude guard-commands "$pd/" "$A:.devbox/profile/"
+    ok "profile $(basename "$pd") installed"
+  fi
+  ok "helpers installed (idle stop after ${IDLE_MIN}m)"
+}
+
+cmd_setup_identity() {
+  local qn qe; printf -v qn '%q' "$GIT_NAME"; printf -v qe '%q' "$GIT_EMAIL"
+  ssh "$A" "git config --global user.name $qn && git config --global user.email $qe \\
+    && git config --global pull.ff only && git config --global init.defaultBranch main \
+    && mkdir -p ~/.ssh && (ssh-keygen -F github.com >/dev/null 2>&1 || ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null) \
+    && ([ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -C '$DEVBOX_NAME' -f ~/.ssh/id_ed25519 >/dev/null)"
+  ok "git identity: $GIT_NAME <$GIT_EMAIL>"
+  local out; out=$(ssh "$A" 'ssh -o BatchMode=yes -T git@github.com 2>&1 || true')
+  if [[ "$out" == *"successfully authenticated"* ]]; then ok "box GitHub key already works"
+  else
+    local pub tmp; pub=$(ssh "$A" 'cat ~/.ssh/id_ed25519.pub'); tmp="$(mktemp)"; echo "$pub" >"$tmp"
+    if command -v gh >/dev/null && gh ssh-key add "$tmp" --title "$DEVBOX_NAME" >/dev/null 2>&1; then ok "added the box key to your GitHub account (gh)"
+    else warn "add this key at https://github.com/settings/keys (title $DEVBOX_NAME), or run 'gh auth refresh -s admin:public_key' and retry:"
+      echo "    $pub"; fi
+    rm -f "$tmp"
+  fi
+  if [[ "$COPY_AWS_CONFIG" == yes && -f "$HOME/.aws/config" ]]; then
+    if grep -qiE 'aws_secret_access_key|aws_session_token|credential_process' "$HOME/.aws/config"; then
+      warn "~/.aws/config contains credentials or credential_process — not copied (move keys to ~/.aws/credentials)"
+    else ssh "$A" 'mkdir -p ~/.aws && chmod 700 ~/.aws && { [ ! -f ~/.aws/config ] || cp ~/.aws/config ~/.aws/config.bak; }'
+      scp -q "$HOME/.aws/config" "$A:.aws/config"; ssh "$A" 'chmod 600 ~/.aws/config'; ok "copied ~/.aws/config (profiles only)"; fi
+  fi
+}
+
+cmd_clone() {
+  [[ -n "$REPOS" ]] || { warn "REPOS is empty in the config — nothing to clone"; return; }
+  local r slug path
+  for r in $REPOS; do
+    slug="${r%%:*}"; path="${r#*:}"
+    ssh "$A" "set -e; if [ -d ~/$path/.git ]; then echo '  = $path exists'; else mkdir -p \"\$(dirname ~/$path)\" && git clone -q git@github.com:$slug.git ~/$path && echo '  + cloned $slug -> ~/$path'; fi
+      claude-trust ~/$path >/dev/null
+      if [ -d ~/$path/memory ] && [ ! -f ~/$path/.claude/settings.local.json ]; then
+        mkdir -p ~/$path/.claude && printf '{\n  \"autoMemoryDirectory\": \"%s\"\n}\n' \"\$HOME/$path/memory\" > ~/$path/.claude/settings.local.json && echo '    memory dir set for $path'; fi"
+  done
+  ok "main checkouts trusted for Claude (claude-trust)"
+}
+
+cmd_install_guard() {
+  mkdir -p "$HOME/.claude/hooks"
+  install -m 755 "$KIT/laptop/devbox-heavy-guard.sh" "$KIT/laptop/devbox-heavy-guard.py" "$HOME/.claude/hooks/"
+  python3 - <<'PY'
+import json, os, shutil, time
+p = os.path.expanduser("~/.claude/settings.json")
+d = json.load(open(p)) if os.path.exists(p) else {}
+cmd = "sh " + os.path.expanduser("~/.claude/hooks/devbox-heavy-guard.sh")
+pre = d.setdefault("hooks", {}).setdefault("PreToolUse", [])
+if any("devbox-heavy-guard" in h.get("command", "") for m in pre for h in m.get("hooks", [])):
+    print("  guard already registered in", p)
+else:
+    if os.path.exists(p):
+        shutil.copy2(p, p + ".bak-devbox-guard-" + time.strftime("%Y%m%d%H%M%S"))
+    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
+    json.dump(d, open(p, "w"), indent=2)
+    print("  guard registered in", p)
+PY
+  local md="$HOME/.claude/CLAUDE.md"
+  if grep -q '^# Heavy work → devbox' "$md" 2>/dev/null; then ok "global CLAUDE.md already has the Heavy work → devbox section"
+  else { [[ -s "$md" ]] && printf '\n'; sed "s/__ALIAS__/$A/g" "$KIT/laptop/claude-md-heavy-work.md"; } >>"$md"; ok "added the Heavy work → devbox section to $md"; fi
+  "$KIT/tests/test-guard.sh" "$HOME/.claude/hooks/devbox-heavy-guard.sh"
+}
+
+cmd_install_skill() {
+  local s dst
+  for s in "$KIT"/.claude/skills/*/; do
+    [[ -f "${s}SKILL.md" ]] || continue
+    s="${s%/}"; s="${s##*/}"
+    dst="$HOME/.claude/skills/$s"; mkdir -p "$dst"
+    sed "s#__KIT_DIR__#$KIT#g" "$KIT/.claude/skills/$s/SKILL.md" >"$dst/SKILL.md"
+    ok "installed /$s to $dst"
+  done
+  echo "restart Claude Code to load them"
+}
+
+case "$cmd" in
+  help|-h|--help) usage ;;
+  init)           cmd_init "$@" ;;
+  install-skill)  cmd_install_skill ;;
+  *)
+    load_config
+    case "$cmd" in
+      check)          cmd_check ;;
+      provision)      cmd_provision "$@" ;;
+      destroy)        cmd_destroy "$@" ;;
+      ssh-config)     cmd_ssh_config ;;
+      up)             need_iid; aws ec2 start-instances --instance-ids "$I" >/dev/null; aws ec2 wait instance-running --instance-ids "$I"; wait_ssm "$I" ;;
+      down)           need_iid; ssh -O exit "$A" 2>/dev/null; aws ec2 stop-instances --instance-ids "$I" >/dev/null; echo "stopping $I (disks kept; only EBS is billed)" ;;
+      status)         need_iid; read -r s t <<<"$(state "$I")"; echo "$DEVBOX_NAME $I  $s  $t"
+                      [[ "$s" == running ]] && ssh "$A" 'sudo -n /usr/local/sbin/devbox-idle-check --explain' || true ;;
+      ssh)            exec ssh "$A" "$@" ;;
+      bootstrap)      ssh "$A" "GCLOUD=$GCLOUD bash -s" <"$KIT/box/bootstrap-tools.sh"
+                      if [[ -n "$PROFILE" && -f "$PROFILE/bootstrap.sh" ]]; then ssh "$A" 'bash -s' <"$PROFILE/bootstrap.sh"; ok "profile bootstrap ran"; fi ;;
+      push-helpers)   cmd_push_helpers ;;
+      setup-identity) cmd_setup_identity ;;
+      clone)          cmd_clone ;;
+      login)          exec ssh -t "$A" 'bash -ic devbox-login' ;;
+      doctor)         exec ssh -t "$A" devbox-doctor --full ;;
+      wip)            need_iid; WIP_ROOTS="$WIP_ROOTS" WIP_LABEL="laptop ($(hostname -s))" bash "$KIT/laptop/wip.sh"
+                      read -r s _ <<<"$(state "$I")"
+                      if [[ "$s" == running ]]; then ssh "$A" "WIP_ROOTS='$WIP_ROOTS' WIP_LABEL=$A bash -s" <"$KIT/laptop/wip.sh"
+                      else echo "== $A"; echo "  box is $s — its work isn't visible (devbox up)"; fi ;;
+      keepawake)      if [[ "${1:-}" == off ]]; then ssh "$A" 'sudo rm -f /data/keepawake' && echo "keepawake off"
+                      else ssh "$A" 'sudo touch /data/keepawake' && echo "keepawake on for 12h (devbox keepawake off to clear)"; fi ;;
+      resize)         t="${1:?usage: devbox resize INSTANCE_TYPE}"; need_iid
+                      ssh -O exit "$A" 2>/dev/null; aws ec2 stop-instances --instance-ids "$I" >/dev/null; aws ec2 wait instance-stopped --instance-ids "$I"
+                      aws ec2 modify-instance-attribute --instance-id "$I" --instance-type "{\"Value\":\"$t\"}"
+                      aws ec2 start-instances --instance-ids "$I" >/dev/null; aws ec2 wait instance-running --instance-ids "$I"
+                      wait_ssm "$I"; state "$I"; warn "update INSTANCE_TYPE in $CFG_DIR/$BOX.env to match" ;;
+      sync-claude)    SSH_HOST_ALIAS="$A" SYNC_CLAUDE_ENV="$SYNC_CLAUDE_ENV" RETIRED_SKILLS="$RETIRED_SKILLS" RETIRED_PLUGINS="$RETIRED_PLUGINS" RETIRED_HOOKS="$RETIRED_HOOKS" \
+                        exec python3 "$KIT/laptop/sync-claude.py" "$@" ;;
+      install-guard)  cmd_install_guard ;;
+      *) usage; exit 1 ;;
+    esac ;;
+esac

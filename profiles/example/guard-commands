@@ -1,0 +1,4 @@
+# Project commands the laptop guard should route to the box ("Run where?").
+# label: command [first-arg]
+# Docker stack: ./scripts/dev-up.sh
+# Docker stack: make up

@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""claude-trust PATH... : pre-accept Claude Code's folder-trust dialog for each PATH.
+
+Agent workers started in a new worktree (e.g. by Orca; see docs/orca.md) stall on
+"Is this a project you trust?" — the injected task lands in the dialog. Claude Code
+keys trust for a git worktree on the repo's MAIN checkout, so trust the main
+checkout once (e.g. ~/Dev/myrepo) and every worktree of it starts clean.
+Parent-folder trust (~/Dev) does NOT cover repos whose .claude/settings.json
+pre-approves tools, and a repo nested inside another is separate. Verified on
+Claude Code 2.1.281 (2026-09). Writes ~/.claude.json atomically (temp file + rename).
+"""
+import json, os, sys, tempfile
+paths = [os.path.abspath(p) for p in sys.argv[1:]] or sys.exit(__doc__)
+cfg = os.path.expanduser("~/.claude.json")
+d = json.load(open(cfg)) if os.path.exists(cfg) else {}
+for p in paths:
+    d.setdefault("projects", {}).setdefault(p, {})["hasTrustDialogAccepted"] = True
+    print(f"trusted {p}")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg), prefix=".claude.json.")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, cfg)

@@ -1,0 +1,15 @@
+# tests/leak-patterns — your PRIVATE identifier list. Copy to tests/leak-patterns
+# (gitignored) and fill in yours. One ERE per line; '#' comments and blank lines
+# are skipped. Patterns are validated before use; an invalid line fails the scan.
+#
+# List things that must NEVER appear in this repo: AWS account IDs, employer and
+# product names, internal hostnames, project codewords, old email addresses.
+# Do NOT list your public attribution (your name, GitHub handle, the repo URL):
+# it belongs in LICENSE/README/SETUP by design. Put those in tests/attribution
+# (also gitignored) — the publication gate allows them only under LICENSE,
+# README.md, SETUP.md, and docs/.
+123456789012                    # an AWS account id (example)
+234567890123                    # another account you use (example)
+old-employer-name|oldproduct
+internal-hostname
+first\.last@old-employer\.com
