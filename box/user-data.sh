@@ -80,16 +80,21 @@ cat >/usr/local/sbin/devbox-idle-check <<'EOF'
 #   keepawake /data/keepawake touched within 12h (`devbox keepawake`), for agents that wait
 #             silently on an API
 #   boot      uptime < IDLE_MIN (grace after `devbox up`)
+#
+# Each timer run logs its verdict (tag devbox-idle) when the busy reasons change, and at
+# least hourly while busy, naming the terminal and its processes when tty is the reason.
+# Read it with: journalctl -t devbox-idle --since today
 set -uo pipefail
 . /etc/devbox.env
 IDLE_MIN="${DEVBOX_IDLE_MIN:-${IDLE_MIN:-45}}"   # DEVBOX_IDLE_MIN overrides, for testing only
 STATUS=/run/devbox-idle-status
-now=$(date +%s); win=$((IDLE_MIN * 60)); why=""; last=0
+LASTLOG=/run/devbox-idle-lastlog
+now=$(date +%s); win=$((IDLE_MIN * 60)); why=""; last=0; tty_dev=""
 
 for t in /dev/pts/[0-9]*; do
   [[ -e "$t" ]] || continue
   m=$(stat -c %Y "$t"); a=$(stat -c %X "$t"); (( a > m )) && m=$a
-  (( m > last )) && last=$m
+  (( m > last )) && { last=$m; tty_dev=${t#/dev/}; }
 done
 (( last > 0 && now - last < win )) && why="tty"
 # Multiplexed commands only reach the journal at LogLevel VERBOSE; ensure it (self-healing).
@@ -114,6 +119,19 @@ if [[ -n "$why" ]]; then verdict="busy ($why)"; else verdict="idle"; fi
 echo "$verdict | $act | load15 $(cut -d' ' -f3 /proc/loadavg) | uptime $((up / 60))m | stops after ${IDLE_MIN}m idle" >"$STATUS"
 
 if [[ "${1:-}" == --explain ]]; then cat "$STATUS"; exit 0; fi
+
+# Why is it busy? Log on change, and hourly while busy, so a box that never stopped is explainable.
+detail=""
+if [[ "$why" == *tty* && -n "$tty_dev" ]]; then
+  procs=$(ps -t "$tty_dev" -o comm= 2>/dev/null | sort -u | paste -sd, -)
+  detail=" | tty $tty_dev (${procs:-?}) active $(( (now - last) / 60 ))m ago"
+fi
+(( last_ssh > 0 )) && detail="$detail | last ssh $(( (now - last_ssh) / 60 ))m ago"
+read -r prev_why prev_t 2>/dev/null <"$LASTLOG" || true
+if [[ -n "$why" ]] && { [[ "$why" != "${prev_why:-}" ]] || (( now - ${prev_t:-0} >= 3600 )); }; then
+  logger -t devbox-idle "busy ($why)$detail | load15 $(cut -d' ' -f3 /proc/loadavg)"
+  echo "$why $now" >"$LASTLOG"
+fi
 if [[ -z "$why" ]]; then
   logger -t devbox-idle "idle: $act, low load, no keepawake — stopping instance"
   shutdown -h now
