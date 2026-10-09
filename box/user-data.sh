@@ -69,8 +69,12 @@ cat >/usr/local/sbin/devbox-idle-check <<'EOF'
 # Runs every 5 min from devbox-idle.timer. InstanceInitiatedShutdown=stop, so halt = stop.
 #
 # Busy if ANY of:
-#   tty       a terminal (/dev/pts/N) was written or read within IDLE_MIN. Covers typing
-#             and agents producing output. An idle Claude prompt writes nothing.
+#   tty       a terminal (/dev/pts/N) was typed into (read) within IDLE_MIN, or its processes
+#             (and the children they ran) used > TTY_CPU_PCT of a core between two checks
+#             within IDLE_MIN. Output alone doesn't count: idle agent TUIs (Codex, Claude)
+#             redraw every few minutes at ~1% CPU and would keep the box up forever, while a
+#             working agent runs at several %. Per-terminal CPU samples live in $TTY_STATE;
+#             with no earlier sample (first run after boot or an update) any output counts.
 #   ssh       an SSH connection or command started within IDLE_MIN (sshd "Accepted", or
 #             "Starting session", which LogLevel VERBOSE logs for every command, including
 #             ones multiplexed over the laptop's ControlMaster connection). So laptop agents
@@ -89,12 +93,35 @@ set -uo pipefail
 IDLE_MIN="${DEVBOX_IDLE_MIN:-${IDLE_MIN:-45}}"   # DEVBOX_IDLE_MIN overrides, for testing only
 STATUS=/run/devbox-idle-status
 LASTLOG=/run/devbox-idle-lastlog
-now=$(date +%s); win=$((IDLE_MIN * 60)); why=""; last=0; tty_dev=""
+TTY_STATE=/run/devbox-idle-tty   # per terminal: name cpu_ticks sample_epoch last_active_epoch
+TTY_CPU_PCT=2.5
+now=$(date +%s); win=$((IDLE_MIN * 60)); why=""; last=0; tty_dev=""; tty_note=""
+hz=$(getconf CLK_TCK)
 
+# CPU ticks (utime+stime+cutime+cstime) per controlling terminal; pts majors are 136-143.
+declare -A cur pticks pt plast
+while read -r k v; do cur[$k]=$v; done < <(
+  for st in /proc/[0-9]*/stat; do read -r l <"$st" 2>/dev/null && echo "${l##*) }"; done |
+    awk '{ M = int($5 / 256); if (M < 136 || M > 143) next
+           a["pts/" ((M - 136) * 256 + $5 % 256)] += $12 + $13 + $14 + $15 }
+         END { for (k in a) print k, a[k] }')
+if [[ -r "$TTY_STATE" ]]; then
+  while read -r k tk ts la; do pticks[$k]=$tk; pt[$k]=$ts; plast[$k]=$la; done <"$TTY_STATE"
+fi
+state=""
 for t in /dev/pts/[0-9]*; do
   [[ -e "$t" ]] || continue
-  m=$(stat -c %Y "$t"); a=$(stat -c %X "$t"); (( a > m )) && m=$a
-  (( m > last )) && { last=$m; tty_dev=${t#/dev/}; }
+  k=${t#/dev/}; c=${cur[$k]:-0}; act=$(stat -c %X "$t"); la=${plast[$k]:-0}; note="typed"
+  if [[ -n "${pt[$k]:-}" ]] && (( now > pt[$k] )); then
+    d=$(( c - pticks[$k] )); (( d < 0 )) && d=0
+    # busy if d / (dt * hz) > TTY_CPU_PCT / 100
+    if awk -v d="$d" -v dt=$(( now - pt[$k] )) -v hz="$hz" -v p="$TTY_CPU_PCT" 'BEGIN{exit !(d * 100 > dt * hz * p)}'; then la=$now; fi
+  else
+    o=$(stat -c %Y "$t"); (( o > la )) && la=$o   # no baseline yet: output counts
+  fi
+  (( la > act )) && { act=$la; note="cpu"; }
+  (( act > last )) && { last=$act; tty_dev=$k; tty_note=$note; }
+  state+="$k $c $now $la"$'\n'
 done
 (( last > 0 && now - last < win )) && why="tty"
 # Multiplexed commands only reach the journal at LogLevel VERBOSE; ensure it (self-healing).
@@ -119,12 +146,13 @@ if [[ -n "$why" ]]; then verdict="busy ($why)"; else verdict="idle"; fi
 echo "$verdict | $act | load15 $(cut -d' ' -f3 /proc/loadavg) | uptime $((up / 60))m | stops after ${IDLE_MIN}m idle" >"$STATUS"
 
 if [[ "${1:-}" == --explain ]]; then cat "$STATUS"; exit 0; fi
+printf '%s' "$state" >"$TTY_STATE"
 
 # Why is it busy? Log on change, and hourly while busy, so a box that never stopped is explainable.
 detail=""
 if [[ "$why" == *tty* && -n "$tty_dev" ]]; then
   procs=$(ps -t "$tty_dev" -o comm= 2>/dev/null | sort -u | paste -sd, -)
-  detail=" | tty $tty_dev (${procs:-?}) active $(( (now - last) / 60 ))m ago"
+  detail=" | tty $tty_dev (${procs:-?}) ${tty_note} $(( (now - last) / 60 ))m ago"
 fi
 (( last_ssh > 0 )) && detail="$detail | last ssh $(( (now - last_ssh) / 60 ))m ago"
 read -r prev_why prev_t 2>/dev/null <"$LASTLOG" || true
