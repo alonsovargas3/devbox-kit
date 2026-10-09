@@ -28,7 +28,9 @@ for c in "docker compose up -d" "docker-compose up -d db web" "docker compose -f
   "yarn lint" "npx run-s lint:*" "eslint src" "phpcs app" "rubocop" "npm run build" "yarn build" \
   "ember build --environment=production" "vite build" \
   "git add x && git commit -m 'wip' && npx jest --ci" "echo start; yarn lint" 'out=$(npm test)' \
-  "make up" "./scripts/dev-up.sh"; do
+  "make up" "./scripts/dev-up.sh" \
+  "python -m pytest -q" "python3 -m pytest tests/unit" "python3.12 -u -m pytest -x" "cd api && python -m tox" \
+  "python -m unittest discover"; do
   t ask "$c"
 done
 
@@ -36,7 +38,8 @@ for c in "docker ps" "docker compose ps" "docker compose logs -f web" "docker lo
   "git log --oneline" "cat phpunit.xml" "grep -rn lint package.json" "ssh devbox 'cd Dev/x && npm test'" \
   "ssh -t devbox 'pytest'" "devbox ssh 'npm test'" "gh pr view 1" "npm install" "yarn install" "go vet ./..." \
   "make lint-fix-docs" "make" "DEVBOX_RUN=local yarn lint" "cd x && DEVBOX_RUN=local vendor/bin/phpunit" \
-  'gh issue comment 66 -b "uses jest 29 and yarn test and docker compose up"' "echo 'run pytest later'"; do
+  'gh issue comment 66 -b "uses jest 29 and yarn test and docker compose up"' "echo 'run pytest later'" \
+  "python -m pip install -r requirements.txt" "python3 -m venv .venv" "python -c 'import pytest'" "python -m"; do
   t allow "$c"
 done
 t allow "$(printf '%s\n' "cat >> notes.md <<'EOF'" "- jest 29 snapshot; ran yarn test on the box" \
