@@ -68,6 +68,9 @@ def classify(tokens, rules):
         t.pop(0)
     if not t:
         return None
+    # `python -m <module> ...` runs <module>: classify it as if it were the command.
+    if re.match(r"^python[0-9.]*$", os.path.basename(t[0])) and "-m" in t[1:-1]:
+        t = t[t.index("-m", 1) + 1:]
     cmd, rest = os.path.basename(t[0]), t[1:]
     a1 = rest[0] if rest else ""
     head = " ".join(t[:3])
@@ -90,7 +93,7 @@ def classify(tokens, rules):
         return None
     if cmd == "phpunit" or t[0].endswith("/phpunit"):
         return "test suite", head
-    if cmd in ("jest", "vitest", "bats", "pytest", "rspec", "tox"):
+    if cmd in ("jest", "vitest", "bats", "pytest", "rspec", "tox", "unittest"):
         return "test suite", head
     if cmd in ("eslint", "phpcs", "rubocop"):
         return "lint", head
